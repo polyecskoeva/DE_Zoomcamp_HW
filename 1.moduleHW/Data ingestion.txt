@@ -1,0 +1,121 @@
+Data ingestion:
+
+import argparse, os, sys
+from time import time
+import pandas as pd 
+import pyarrow.parquet as pq
+from sqlalchemy import create_engine
+import subprocess
+import gzip
+import shutil
+
+def download_file(url, file_name):
+
+    print(f"Download starts: {url}")
+    subprocess.run(['wget', url, '-O', file_name], check=True)
+    print(f"{file_name} downloaded.")
+
+def extract_gzip(file_name):
+
+    print(f"Unzip starts: {file_name}")
+    if file_name.endswith('.gz'):
+        with gzip.open(file_name, 'rb') as f_in:
+            with open(file_name[:-3], 'wb') as f_out:
+                shutil.copyfileobj(f_in, f_out)
+        os.remove(file_name)  
+        print(f"{file_name[:-3]} unzipped.")
+        return file_name[:-3] 
+    else:
+        print("The file is no zipped, no need for unzip")
+        return file_name
+
+def main(params):
+    user = params.user
+    password = params.password
+    host = params.host
+    port = params.port
+    db = params.db
+    tb = params.tb
+    url = params.url
+    
+    # A fájl nevének kinyerése az URL-ből
+    file_name = url.rsplit('/', 1)[-1].strip()
+    print(f'Letöltés: {file_name} ...')
+    
+    # Fájl letöltése
+    download_file(url, file_name)
+    
+    # Kicsomagolás, ha .gz fájl
+    extracted_file = extract_gzip(file_name)
+
+    # Create SQL engine
+    engine = create_engine(f'postgresql://{user}:{password}@{host}:{port}/{db}')
+
+    # Read file based on csv or parquet
+    if '.csv' in extracted_file:
+        df = pd.read_csv(extracted_file, nrows=10)
+        df_iter = pd.read_csv(extracted_file, iterator=True, chunksize=100000)
+    elif '.parquet' in extracted_file:
+        file = pq.ParquetFile(extracted_file)
+        df = next(file.iter_batches(batch_size=10)).to_pandas()
+        df_iter = file.iter_batches(batch_size=100000)
+    else: 
+        print('Error. Only .csv or .parquet files allowed.')
+        sys.exit()
+
+    # Create the table
+    df.head(0).to_sql(name=tb, con=engine, if_exists='replace')
+
+    # Insert values
+    t_start = time()
+    count = 0
+    for batch in df_iter:
+        count += 1
+
+        if '.parquet' in extracted_file:
+            batch_df = batch.to_pandas()
+        else:
+            batch_df = batch
+
+        print(f'inserting batch {count}...')
+
+        b_start = time()
+        batch_df.to_sql(name=tb, con=engine, if_exists='append')
+        b_end = time()
+
+        print(f'inserted! time taken {b_end - b_start:10.3f} seconds.\n')
+        
+    t_end = time()   
+    print(f'Completed! Total time taken was {t_end - t_start:10.3f} seconds for {count} batches.')    
+
+if __name__ == '__main__':
+
+    parser = argparse.ArgumentParser(description='Loading data from .csv or .parquet file link to a Postgres database.')
+
+    parser.add_argument('--user', help='Username for Postgres.')
+    parser.add_argument('--password', help='Password to the username for Postgres.')
+    parser.add_argument('--host', help='Hostname for Postgres.')
+    parser.add_argument('--port', help='Port for Postgres connection.')
+    parser.add_argument('--db', help='Database name for Postgres')
+    parser.add_argument('--tb', help='Destination table name for Postgres.')
+    parser.add_argument('--url', help='URL for .csv or .parquet file.')
+
+
+    args = parser.parse_args()
+
+   
+    main(args)
+
+
+Docerkfile:
+FROM python:3.12.2
+
+RUN apt-get update && apt-get install -y wget \
+    && pip install pandas sqlalchemy psycopg2 pyarrow requests
+
+WORKDIR /app
+COPY ingest_data_HW.py ingest_data_HW.py 
+
+ENTRYPOINT ["python", "ingest_data_HW.py"]
+
+
